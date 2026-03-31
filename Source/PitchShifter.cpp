@@ -2,6 +2,10 @@
 #include <cmath>
 #include <algorithm>
 
+// With 4x overlap Hann windows, the sum of windows is approximately 2.0.
+// We divide by this to normalize the output level.
+static constexpr float kHannOlaNormalization = 2.0f;
+
 PitchShifter::PitchShifter()
 {
 }
@@ -20,35 +24,33 @@ void PitchShifter::prepare (double sampleRate, int /*maxBlockSize*/)
     outputBufferSize = hundredMs + 2 * kMaxGrainSize;
     outputBuffer.assign ((size_t) outputBufferSize, 0.0f);
     outputReadPos = 0;
-    outputWritePos = 0;
+    // Start the write position ahead of read position by one grain size
+    // so grains are fully written before we read them
+    outputWritePos = kMaxGrainSize;
 
     grainSize = 512;
+    nextGrainSize = 512;
     hopSize = grainSize / kOverlap;
     samplesSinceLastGrain = 0;
-    grainReadPos = 0.0;
 
-    // Pre-compute max Hann window
+    // Pre-compute Hann window storage
     hannWindow.resize (kMaxGrainSize);
-    for (int i = 0; i < kMaxGrainSize; ++i)
-        hannWindow[(size_t) i] = 0.5f * (1.0f - std::cos (2.0f * juce::MathConstants<float>::pi * (float) i / (float) kMaxGrainSize));
-
     currentWindow.resize (kMaxGrainSize);
     currentWindowSize = 0;
 }
 
 void PitchShifter::setGrainSizeFromPitch (float detectedPitchHz)
 {
+    // Buffer the grain size change — it will be applied at the next grain boundary
     if (detectedPitchHz > 0.0f)
     {
-        // Grain size = 2 * pitch period
         int period = (int) (currentSampleRate / detectedPitchHz);
-        grainSize = std::clamp (period * 2, kMinGrainSize, kMaxGrainSize);
+        nextGrainSize = std::clamp (period * 2, kMinGrainSize, kMaxGrainSize);
     }
     else
     {
-        grainSize = 512;
+        nextGrainSize = 512;
     }
-    hopSize = grainSize / kOverlap;
 }
 
 void PitchShifter::computeHannWindow (int size)
@@ -115,11 +117,16 @@ void PitchShifter::process (float* audioData, int numSamples, float pitchRatio, 
         if (samplesSinceLastGrain >= hopSize)
         {
             samplesSinceLastGrain = 0;
+
+            // Apply buffered grain size change at grain boundary
+            grainSize = nextGrainSize;
+            hopSize = grainSize / kOverlap;
+
             emitGrain (pitchRatio);
         }
 
-        // Read from output accumulation buffer
-        float shiftedSample = outputBuffer[(size_t) outputReadPos];
+        // Read from output accumulation buffer, normalized
+        float shiftedSample = outputBuffer[(size_t) outputReadPos] / kHannOlaNormalization;
         outputBuffer[(size_t) outputReadPos] = 0.0f; // Clear after reading
         outputReadPos = (outputReadPos + 1) % outputBufferSize;
 

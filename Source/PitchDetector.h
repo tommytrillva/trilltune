@@ -37,6 +37,7 @@ private:
     int samplesAccumulated = 0;
 
     std::vector<float> yinBuffer; // W/2 + 1 elements for difference function
+    std::vector<float> analysisWindow; // Pre-allocated contiguous analysis buffer
 
     PitchResult latestResult;
     std::atomic<float> atomicPitch { 0.0f };

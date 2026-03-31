@@ -83,7 +83,8 @@ void TuneBoxAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBloc
     pitchShifter.prepare (sampleRate, samplesPerBlock);
     smoothedTargetPitch = 0.0f;
     firstDetection = true;
-    dryBuffer.resize ((size_t) samplesPerBlock, 0.0f);
+    // Pre-allocate generously — DAWs may pass blocks larger than samplesPerBlock
+    dryBuffer.resize (std::max ((size_t) samplesPerBlock * 2, (size_t) 8192), 0.0f);
     setLatencySamples (512);
 }
 
@@ -169,7 +170,7 @@ juce::String TuneBoxAudioProcessor::getNoteNameFromHz (float hz)
 
     static const char* noteNames[] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
     float midi = freqToMidi (hz);
-    int midiRounded = (int) std::round (midi);
+    int midiRounded = std::clamp ((int) std::round (midi), 0, 127);
     int note = midiRounded % 12;
     int octave = (midiRounded / 12) - 1;
 
@@ -219,9 +220,9 @@ void TuneBoxAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
     for (int i = 0; i < numSamples; ++i)
         channelData[i] *= inputGain;
 
-    // Store dry signal
-    if ((int) dryBuffer.size() < numSamples)
-        dryBuffer.resize ((size_t) numSamples);
+    // Store dry signal (buffer pre-allocated in prepareToPlay)
+    if ((size_t) numSamples > dryBuffer.size())
+        return; // Safety bail — should never happen with proper prepareToPlay
     std::copy (channelData, channelData + numSamples, dryBuffer.begin());
 
     // Pitch detection
