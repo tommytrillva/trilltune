@@ -35,10 +35,8 @@ private:
     // Grain parameters
     int grainSize = 512;
     int hopSize = 128;
+    int nextGrainSize = 512; // Buffered grain size, applied at grain boundary
     int samplesSinceLastGrain = 0;
-
-    // Read position for resampled grains (fractional)
-    double grainReadPos = 0.0;
 
     // Pre-computed Hann window (max size)
     std::vector<float> hannWindow;

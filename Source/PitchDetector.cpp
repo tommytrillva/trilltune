@@ -6,6 +6,7 @@ PitchDetector::PitchDetector()
 {
     ringBuffer.resize (kBufferSize, 0.0f);
     yinBuffer.resize (kWindowSize / 2 + 1, 0.0f);
+    analysisWindow.resize (kBufferSize, 0.0f);
 }
 
 void PitchDetector::prepare (double sampleRate, int /*maxBlockSize*/)
@@ -53,20 +54,19 @@ PitchResult PitchDetector::analyzeYIN()
 {
     const int halfWindow = kWindowSize / 2;
 
-    // Extract the analysis window from ring buffer into a contiguous array
-    std::vector<float> window (kBufferSize);
+    // Extract the analysis window from ring buffer into pre-allocated contiguous array
     for (int i = 0; i < kBufferSize; ++i)
-        window[(size_t) i] = ringBuffer[(size_t) ((writePos - kBufferSize + i + kBufferSize * 2) % kBufferSize)];
+        analysisWindow[(size_t) i] = ringBuffer[(size_t) ((writePos - kBufferSize + i + kBufferSize * 2) % kBufferSize)];
 
     // Silence gate: check RMS of the most recent window
-    float rms = computeRMS (window.data() + (kBufferSize - kWindowSize), kWindowSize);
+    float rms = computeRMS (analysisWindow.data() + (kBufferSize - kWindowSize), kWindowSize);
     if (rms < kSilenceThreshold)
         return { 0.0f, 0.0f };
 
     // Step 1: Difference function
     // d(tau) = sum_{j=0}^{W/2-1} (x[j] - x[j+tau])^2
-    // We read from the tail of the window buffer
-    const float* x = window.data() + (kBufferSize - kWindowSize - halfWindow);
+    // We read from the tail of the analysis buffer
+    const float* x = analysisWindow.data() + (kBufferSize - kWindowSize - halfWindow);
 
     yinBuffer[0] = 0.0f;
     for (int tau = 1; tau <= halfWindow; ++tau)
