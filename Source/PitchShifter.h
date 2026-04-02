@@ -1,6 +1,7 @@
 #pragma once
 #include <JuceHeader.h>
 #include <vector>
+#include <cmath>
 
 class PitchShifter
 {
@@ -8,44 +9,29 @@ public:
     PitchShifter();
 
     void prepare (double sampleRate, int maxBlockSize);
-    void process (float* audioData, int numSamples, float pitchRatio, float confidence);
-    void setGrainSizeFromPitch (float detectedPitchHz);
+    float processSample (float inputSample, float pitchRatio);
+    void reset();
 
 private:
-    static constexpr int kMaxGrainSize = 2048;
-    static constexpr int kMinGrainSize = 128;
-    static constexpr int kOverlap = 4;
-    static constexpr float kMinRatio = 0.5f;
-    static constexpr float kMaxRatio = 2.0f;
-    static constexpr float kConfidenceThreshold = 0.2f;
+    static constexpr int kBufferSize = 8192; // Power of 2 for fast masking
+    static constexpr int kBufferMask = kBufferSize - 1;
+    static constexpr float kCrossfadeRegion = 0.5f; // Proportion of buffer for crossfade
 
     double currentSampleRate = 44100.0;
 
-    // Input ring buffer
-    std::vector<float> inputBuffer;
-    int inputBufferSize = 0;
-    int inputWritePos = 0;
+    // Circular delay buffer
+    std::vector<float> delayBuffer;
+    int writePos = 0;
 
-    // Output accumulation ring buffer
-    std::vector<float> outputBuffer;
-    int outputBufferSize = 0;
-    int outputReadPos = 0;
-    int outputWritePos = 0;
+    // Two read taps that crossfade to hide discontinuities
+    double readPos1 = 0.0;
+    double readPos2 = 0.0;
+    float crossfadeMix = 0.0f; // 0.0 = tap1 only, 1.0 = tap2 only
 
-    // Grain parameters
-    int grainSize = 512;
-    int hopSize = 128;
-    int nextGrainSize = 512; // Buffered grain size, applied at grain boundary
-    int samplesSinceLastGrain = 0;
+    // Crossfade state
+    bool tap2Active = false;
+    int samplesSinceCrossfade = 0;
+    int crossfadeLength = 512;
 
-    // Pre-computed Hann window (max size)
-    std::vector<float> hannWindow;
-
-    void emitGrain (float pitchRatio);
-    float readInputSample (double pos) const;
-    void computeHannWindow (int size);
-
-    // Current Hann window cache
-    std::vector<float> currentWindow;
-    int currentWindowSize = 0;
+    float readFromBuffer (double pos) const;
 };

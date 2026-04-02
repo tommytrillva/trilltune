@@ -82,6 +82,9 @@ void TuneBoxAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBloc
     pitchDetector.prepare (sampleRate, samplesPerBlock);
     pitchShifter.prepare (sampleRate, samplesPerBlock);
     smoothedTargetPitch = 0.0f;
+    currentPitchRatio = 1.0f;
+    lastDetectedPitch = 0.0f;
+    lastConfidence = 0.0f;
     firstDetection = true;
     // Pre-allocate generously — DAWs may pass blocks larger than samplesPerBlock
     dryBuffer.resize (std::max ((size_t) samplesPerBlock * 2, (size_t) 8192), 0.0f);
@@ -225,15 +228,19 @@ void TuneBoxAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
         return; // Safety bail — should never happen with proper prepareToPlay
     std::copy (channelData, channelData + numSamples, dryBuffer.begin());
 
-    // Pitch detection
+    // Pitch detection (updates when enough samples accumulated)
     PitchResult pitchResult = pitchDetector.detectPitch (channelData, numSamples);
 
+    // Update detection state when we get a valid result
     if (pitchResult.pitchHz > 0.0f && pitchResult.confidence > 0.2f)
     {
+        lastDetectedPitch = pitchResult.pitchHz;
+        lastConfidence = pitchResult.confidence;
+
         // Quantize to scale
         float target = quantizePitchToScale (pitchResult.pitchHz, key, scale);
 
-        // Retune speed smoothing
+        // Retune speed smoothing on the TARGET pitch
         float blockTimeSec = (float) numSamples / (float) currentSampleRate;
         float timeConstantSec = (retuneSpeed / 100.0f) * 0.5f;
         float smoothCoeff = 1.0f - std::exp (-blockTimeSec / std::max (timeConstantSec, 0.001f));
@@ -248,35 +255,43 @@ void TuneBoxAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
             smoothedTargetPitch += (target - smoothedTargetPitch) * smoothCoeff;
         }
 
-        // Compute pitch ratio
-        float pitchRatio = smoothedTargetPitch / pitchResult.pitchHz;
-        pitchRatio = std::clamp (pitchRatio, 0.5f, 2.0f);
-
-        // Update grain size based on detected pitch
-        pitchShifter.setGrainSizeFromPitch (pitchResult.pitchHz);
-
-        // Pitch shift
-        pitchShifter.process (channelData, numSamples, pitchRatio, pitchResult.confidence);
+        // Compute target pitch ratio
+        currentPitchRatio = smoothedTargetPitch / pitchResult.pitchHz;
+        currentPitchRatio = std::clamp (currentPitchRatio, 0.5f, 2.0f);
 
         // Update atomics for GUI
         detectedPitchHz.store (pitchResult.pitchHz, std::memory_order_relaxed);
         detectedConfidence.store (pitchResult.confidence, std::memory_order_relaxed);
         targetPitchHz.store (smoothedTargetPitch, std::memory_order_relaxed);
     }
-    else
+    else if (pitchResult.pitchHz <= 0.0f)
     {
-        // Unvoiced: pass dry signal, update GUI
-        detectedPitchHz.store (0.0f, std::memory_order_relaxed);
-        detectedConfidence.store (0.0f, std::memory_order_relaxed);
-        targetPitchHz.store (0.0f, std::memory_order_relaxed);
+        // Unvoiced — smoothly return to unity ratio
+        lastConfidence *= 0.9f; // Fade confidence
+        if (lastConfidence < 0.05f)
+        {
+            currentPitchRatio = 1.0f;
+            lastConfidence = 0.0f;
+        }
 
-        // Still run through shifter with ratio 1.0 to maintain buffer state
-        pitchShifter.process (channelData, numSamples, 1.0f, 0.0f);
+        detectedPitchHz.store (0.0f, std::memory_order_relaxed);
+        detectedConfidence.store (lastConfidence, std::memory_order_relaxed);
+        targetPitchHz.store (0.0f, std::memory_order_relaxed);
     }
 
-    // Dry/Wet mix
+    // Per-sample pitch shifting + dry/wet mix
     for (int i = 0; i < numSamples; ++i)
-        channelData[i] = dryBuffer[(size_t) i] * (1.0f - mix) + channelData[i] * mix;
+    {
+        float dry = dryBuffer[(size_t) i];
+        float wet = pitchShifter.processSample (channelData[i], currentPitchRatio);
+
+        // Confidence-based blend: when unvoiced, pass dry to avoid artifacts
+        float confBlend = std::clamp (lastConfidence / 0.3f, 0.0f, 1.0f);
+        float shifted = wet * confBlend + dry * (1.0f - confBlend);
+
+        // Dry/Wet mix
+        channelData[i] = dry * (1.0f - mix) + shifted * mix;
+    }
 
     // Apply output gain
     for (int i = 0; i < numSamples; ++i)

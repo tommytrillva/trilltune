@@ -62,6 +62,9 @@ private:
     PitchShifter pitchShifter;
 
     float smoothedTargetPitch = 0.0f;
+    float currentPitchRatio = 1.0f;
+    float lastDetectedPitch = 0.0f;
+    float lastConfidence = 0.0f;
     bool firstDetection = true;
     double currentSampleRate = 44100.0;
 

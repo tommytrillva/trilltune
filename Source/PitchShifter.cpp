@@ -1,144 +1,107 @@
 #include "PitchShifter.h"
-#include <cmath>
 #include <algorithm>
-
-// With 4x overlap Hann windows, the sum of windows is approximately 2.0.
-// We divide by this to normalize the output level.
-static constexpr float kHannOlaNormalization = 2.0f;
 
 PitchShifter::PitchShifter()
 {
+    delayBuffer.resize (kBufferSize, 0.0f);
 }
 
 void PitchShifter::prepare (double sampleRate, int /*maxBlockSize*/)
 {
     currentSampleRate = sampleRate;
-
-    // Input buffer: ~100ms + max grain size
-    int hundredMs = (int) (sampleRate * 0.1);
-    inputBufferSize = hundredMs + kMaxGrainSize;
-    inputBuffer.assign ((size_t) inputBufferSize, 0.0f);
-    inputWritePos = 0;
-
-    // Output buffer: ~100ms + 2 * max grain size
-    outputBufferSize = hundredMs + 2 * kMaxGrainSize;
-    outputBuffer.assign ((size_t) outputBufferSize, 0.0f);
-    outputReadPos = 0;
-    // Start the write position ahead of read position by one grain size
-    // so grains are fully written before we read them
-    outputWritePos = kMaxGrainSize;
-
-    grainSize = 512;
-    nextGrainSize = 512;
-    hopSize = grainSize / kOverlap;
-    samplesSinceLastGrain = 0;
-
-    // Pre-compute Hann window storage
-    hannWindow.resize (kMaxGrainSize);
-    currentWindow.resize (kMaxGrainSize);
-    currentWindowSize = 0;
+    reset();
 }
 
-void PitchShifter::setGrainSizeFromPitch (float detectedPitchHz)
+void PitchShifter::reset()
 {
-    // Buffer the grain size change — it will be applied at the next grain boundary
-    if (detectedPitchHz > 0.0f)
+    std::fill (delayBuffer.begin(), delayBuffer.end(), 0.0f);
+    writePos = 0;
+
+    // Start read taps behind write position
+    int halfBuffer = kBufferSize / 2;
+    readPos1 = 0.0;
+    readPos2 = (double) halfBuffer;
+    crossfadeMix = 0.0f;
+    tap2Active = false;
+    samplesSinceCrossfade = 0;
+    crossfadeLength = kBufferSize / 8; // ~23ms at 44.1k
+}
+
+float PitchShifter::readFromBuffer (double pos) const
+{
+    // Linear interpolation from circular buffer
+    int idx0 = ((int) pos) & kBufferMask;
+    int idx1 = (idx0 + 1) & kBufferMask;
+    float frac = (float) (pos - std::floor (pos));
+
+    return delayBuffer[(size_t) idx0] * (1.0f - frac) + delayBuffer[(size_t) idx1] * frac;
+}
+
+float PitchShifter::processSample (float inputSample, float pitchRatio)
+{
+    // Write input to delay buffer
+    delayBuffer[(size_t) writePos] = inputSample;
+    writePos = (writePos + 1) & kBufferMask;
+
+    // Advance read positions at modified rate
+    // pitchRatio > 1.0 = read faster = pitch up
+    // pitchRatio < 1.0 = read slower = pitch down
+    readPos1 += (double) pitchRatio;
+    readPos2 += (double) pitchRatio;
+
+    // Keep read positions in valid range
+    if (readPos1 >= (double) kBufferSize) readPos1 -= (double) kBufferSize;
+    if (readPos1 < 0.0) readPos1 += (double) kBufferSize;
+    if (readPos2 >= (double) kBufferSize) readPos2 -= (double) kBufferSize;
+    if (readPos2 < 0.0) readPos2 += (double) kBufferSize;
+
+    // Read from both taps
+    float tap1 = readFromBuffer (readPos1);
+    float tap2 = readFromBuffer (readPos2);
+
+    // Check if primary tap is getting too close to write head
+    // or too far behind — need to crossfade to secondary tap
+    double dist1 = (double) writePos - readPos1;
+    if (dist1 < 0.0) dist1 += (double) kBufferSize;
+
+    double dist2 = (double) writePos - readPos2;
+    if (dist2 < 0.0) dist2 += (double) kBufferSize;
+
+    // Danger zone: too close to write head or too far (more than buffer)
+    double minSafe = (double) crossfadeLength * 2.0;
+    double maxSafe = (double) (kBufferSize - crossfadeLength * 2);
+
+    bool tap1InDanger = (dist1 < minSafe || dist1 > maxSafe);
+
+    if (tap1InDanger && !tap2Active)
     {
-        int period = (int) (currentSampleRate / detectedPitchHz);
-        nextGrainSize = std::clamp (period * 2, kMinGrainSize, kMaxGrainSize);
-    }
-    else
-    {
-        nextGrainSize = 512;
-    }
-}
-
-void PitchShifter::computeHannWindow (int size)
-{
-    if (size == currentWindowSize)
-        return;
-
-    currentWindowSize = size;
-    for (int i = 0; i < size; ++i)
-        currentWindow[(size_t) i] = 0.5f * (1.0f - std::cos (2.0f * juce::MathConstants<float>::pi * (float) i / (float) size));
-}
-
-float PitchShifter::readInputSample (double pos) const
-{
-    int idx0 = (int) std::floor (pos);
-    float frac = (float) (pos - (double) idx0);
-
-    idx0 = ((idx0 % inputBufferSize) + inputBufferSize) % inputBufferSize;
-    int idx1 = (idx0 + 1) % inputBufferSize;
-
-    return inputBuffer[(size_t) idx0] * (1.0f - frac) + inputBuffer[(size_t) idx1] * frac;
-}
-
-void PitchShifter::emitGrain (float pitchRatio)
-{
-    computeHannWindow (grainSize);
-
-    // The grain reads from the input buffer starting at a position
-    // behind the current write position
-    double grainStart = (double) inputWritePos - (double) grainSize;
-
-    for (int i = 0; i < grainSize; ++i)
-    {
-        // Resample: read at modified rate for pitch shifting
-        double readIdx = grainStart + (double) i * (double) pitchRatio;
-        float sample = readInputSample (readIdx);
-
-        // Apply Hann window
-        sample *= currentWindow[(size_t) i];
-
-        // Accumulate into output buffer
-        int outIdx = (outputWritePos + i) % outputBufferSize;
-        outputBuffer[(size_t) outIdx] += sample;
+        // Start crossfade: place tap2 at a safe position (half buffer behind write)
+        readPos2 = (double) writePos - (double) (kBufferSize / 2);
+        if (readPos2 < 0.0) readPos2 += (double) kBufferSize;
+        tap2Active = true;
+        samplesSinceCrossfade = 0;
     }
 
-    outputWritePos = (outputWritePos + hopSize) % outputBufferSize;
-}
-
-void PitchShifter::process (float* audioData, int numSamples, float pitchRatio, float confidence)
-{
-    // Clamp pitch ratio
-    pitchRatio = std::clamp (pitchRatio, kMinRatio, kMaxRatio);
-
-    for (int i = 0; i < numSamples; ++i)
+    if (tap2Active)
     {
-        float drySample = audioData[i];
+        ++samplesSinceCrossfade;
+        crossfadeMix = std::clamp ((float) samplesSinceCrossfade / (float) crossfadeLength, 0.0f, 1.0f);
 
-        // Write input sample to ring buffer
-        inputBuffer[(size_t) inputWritePos] = drySample;
-        inputWritePos = (inputWritePos + 1) % inputBufferSize;
-
-        // Check if it's time to emit a new grain
-        ++samplesSinceLastGrain;
-        if (samplesSinceLastGrain >= hopSize)
+        if (crossfadeMix >= 1.0f)
         {
-            samplesSinceLastGrain = 0;
-
-            // Apply buffered grain size change at grain boundary
-            grainSize = nextGrainSize;
-            hopSize = grainSize / kOverlap;
-
-            emitGrain (pitchRatio);
+            // Crossfade complete: swap taps
+            readPos1 = readPos2;
+            tap2Active = false;
+            crossfadeMix = 0.0f;
+            samplesSinceCrossfade = 0;
+            return tap2;
         }
 
-        // Read from output accumulation buffer, normalized
-        float shiftedSample = outputBuffer[(size_t) outputReadPos] / kHannOlaNormalization;
-        outputBuffer[(size_t) outputReadPos] = 0.0f; // Clear after reading
-        outputReadPos = (outputReadPos + 1) % outputBufferSize;
-
-        // Confidence-based blending with dry signal
-        if (confidence < kConfidenceThreshold)
-        {
-            float blend = confidence / kConfidenceThreshold;
-            audioData[i] = shiftedSample * blend + drySample * (1.0f - blend);
-        }
-        else
-        {
-            audioData[i] = shiftedSample;
-        }
+        // Equal-power crossfade for smooth transition
+        float gain1 = std::cos (crossfadeMix * juce::MathConstants<float>::halfPi);
+        float gain2 = std::sin (crossfadeMix * juce::MathConstants<float>::halfPi);
+        return tap1 * gain1 + tap2 * gain2;
     }
+
+    return tap1;
 }
